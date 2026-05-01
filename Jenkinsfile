@@ -1,93 +1,51 @@
-#!/usr/bin/env groovy
-
 pipeline {
-    environment{
-       FEATURE_NAME = BRANCH_NAME.replaceAll('[\\(\\)_/]','-').toLowerCase()
-       REGISTRY_PASSWORD = credentials('REGISTRY_PASSWORD')
-       REGISTRY_USERNAME = credentials('REGISTRY_USERNAME')
-       POSTGRES_PASSWORD = credentials('POSTGRES_PASSWORD')
-       APP_NAME = "cicd-demo"
+    agent any
+
+    tools { 
+        maven 'maven3' 
     }
-    agent any 
+
     stages {
-        stage('Docker Build & Push') {
+        // --- PARTE 1: COMPILACION ---
+        stage('Build') {
             steps {
-                sh "make dockerLogin build dockerBuild dockerPush"
-            }
-
-        }
-		// not in parallel due to race condition with .env
-        stage('Docker Scan') {
-            steps {
-                sh "make dockerScan"
-            }
-            post {
-                cleanup {
-                    sh "docker-compose down -v"
-                }
-            }
-        }
-        
-        stage('Parallel Tests') {
-            failFast true            
-            parallel {                  
-                stage('Static Code Analysis') {
-                    when {
-                        anyOf { branch 'master'; branch 'release'}
-                    }    
-                    steps {
-                        sh "make publishSonar"                        
-                    }
-                }
-                stage('Integration Tests') {
-                    steps {
-                        sh "make integrationTest"
-                    }
-                }
-            }
-        }
-        stage('Push Latest Tag') {
-            when { branch 'master' }
-            steps {
-                sh "make dockerPushLatest"
+                sh 'mvn clean package -DskipTests=true'
             }
         }
 
-        stage('Deploy To dev') {
-            environment { 
-                ENV = "dev"
-                APP_DNS = util.selectAppUrl(ENV, FEATURE_NAME, APP_NAME)
-                KUBE_SERVER = credentials("KUBE_API_SERVER")
-                KUBE_TOKEN = credentials("KUBE_DEV_TOKEN")
-            }
+        // --- PARTE 2: ANALISIS DE CALIDAD (SONAR) ---
+        stage('SonarQube') {
             steps {
-                sh "make kubeLogin deploy"
+                sh "mvn sonar:sonar -Dsonar.projectKey=my-app -Dsonar.host.url=http://sonarqube:9000/ -Dsonar.login=sqp_ccb517f4c76df18cf4b227db8774cf4b9149da43 -Dsonar.qualitygate.wait=true"
             }
         }
-        
-        stage('Deploy To qa') {
-            when { expression { BRANCH_NAME ==~ /(master|release-[0-9]+$)/ }} // Only Master and Release branches 
-            environment { 
-                ENV = "qa"
-                APP_DNS = util.selectAppUrl(ENV, FEATURE_NAME, APP_NAME)
-                KUBE_SERVER = credentials("KUBE_API_SERVER")
-                KUBE_TOKEN = credentials("KUBE_QA_TOKEN")
-            }
+
+        // --- PARTE 3: ESCANEO DE SEGURIDAD (TRIVY) ---
+        stage('Seguridad') {
             steps {
-                sh "make kubeLogin deploy"
+                sh 'docker build -t mi-app:latest .'
+                // El exit-code 1 bloquea el despliegue si hay vulnerabilidades criticas
+                sh 'trivy image --severity CRITICAL --exit-code 1 mi-app:latest'
             }
         }
-        
+
+        // --- PARTE 4: DESPLIEGUE EN PUERTO 80 ---
+        stage('Deploy') {
+            steps {
+                sh 'docker stop mi-app-container || true'
+                sh 'docker rm mi-app-container || true'
+                sh 'docker run -d --name mi-app-container -p 80:8080 mi-app:latest'
+            }
+        }
     }
+
+    // --- MANEJO DE ERRORES Y LIMPIEZA ---
     post {
         always {
-            script {
-                if(BRANCH_NAME ==~ /(master|release-[0-9]+$)/ ){
-                     util.notifySlack(currentBuild.result)
-                 }
-            }
-            archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
-            junit 'target/surefire-reports/*.xml'
+            cleanWs()
+        }
+        failure {
+            echo 'Algo salio mal en el proceso, revisar logs de Jenkins'
         }
     }
 }
